@@ -26,8 +26,10 @@
 #if BS_GPU
 
 #include <cassert>
+#include <chrono>
 #include <mutex>
 #include <string>
+#include <thread>
 
 extern "C" {
 #include <libavutil/frame.h>
@@ -195,6 +197,9 @@ struct BSGpuHasher::Impl {
        and teardown knows when the last one is done. */
     VkSemaphore Done = VK_NULL_HANDLE;
     uint64_t Submitted = 0;
+    /* Latched on the first sign the device was reset, so later waits and dispatches fail fast
+       instead of feeding a dead device. Only touched under the caller's serialization. */
+    bool Lost = false;
 
     /* One pipeline per sample size and pass, created on first use. Which pass it is comes in as a
        specialization constant, so the hash pipeline carries no plane writing code and the export
@@ -222,9 +227,17 @@ struct BSGpuHasher::Impl {
        has completed or was never submitted. */
     void RetireContext(ExecContext &C);
     void RetireCompleted();
-    /* Waits for every submission so far, then retires all contexts. A failed wait can only be
-       a lost device, where nothing further is reachable anyway, so it does not throw. */
-    void FinishAll();
+    /* What a host wait on Done established. The distinction between the failures is the whole
+       point: after a reset nothing is executing, so everything a submission held may be
+       released, while an ordinary failure leaves it queued and untouchable. The same shape as
+       VapourSynth's VSGPUDrainResult, for the same reasons. */
+    enum class WaitResult { Drained, Incomplete, DeviceLost };
+    WaitResult WaitDone(uint64_t Value);
+    /* Waits for every submission so far and retires all contexts when that is safe: after a
+       drained wait, or after a reset. Returns false when the wait failed with work possibly
+       still running, in which case nothing was retired -- releasing what a live dispatch may
+       still be reading would be worse than the leak. */
+    bool FinishAll();
     /* Targets is what selects the pass. Null hashes, and ExportWidth/ExportHeight are then ignored
        -- a hash must cover the full decoded frame, since that is what the index hashes were computed
        over. Set, it exports, and they bound the writes to the destination's extent, which for odd
@@ -348,10 +361,70 @@ void BSGpuHasher::Impl::RetireContext(ExecContext &C) {
     C.Value = 0;
 }
 
+/* Every host wait on Done goes through this, mirroring the wait policy the VapourSynth core
+   adopted and VSVulkan4.h now demands of filters: a wait returning is not proof the work ran.
+   A GPU reset releases waiters by force-signalling timelines past anything they could be
+   waiting for -- Windows' TDR takes them to the 64 bit maximum -- so the counter is read back
+   after every successful wait, and a value past everything ever submitted means the device
+   was reset, not that the work completed. An allocation failure inside the wait is retried
+   rather than reported, since reporting it as either completion or loss would be wrong. This
+   timeline lives on FFmpeg's device, not the core's, so the core's own checked waits cannot
+   cover it and the policy is applied here. The one reset no query can see -- a driver that
+   signals exactly the pending values and reports no loss anywhere -- is documented and
+   accepted by the core, and the same limit applies here. */
+BSGpuHasher::Impl::WaitResult BSGpuHasher::Impl::WaitDone(uint64_t Value) {
+    if (Lost)
+        return WaitResult::DeviceLost;
+    VkSemaphoreWaitInfo SWI = {};
+    SWI.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+    SWI.semaphoreCount = 1;
+    SWI.pSemaphores = &Done;
+    SWI.pValues = &Value;
+    while (true) {
+        VkResult Res = VK.vkWaitSemaphores(Device, &SWI, UINT64_MAX);
+        if (Res == VK_SUCCESS)
+            break;
+        if (Res == VK_ERROR_OUT_OF_HOST_MEMORY || Res == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
+        if (Res == VK_ERROR_DEVICE_LOST)
+            Lost = true;
+        return Lost ? WaitResult::DeviceLost : WaitResult::Incomplete;
+    }
+    uint64_t Reached = 0;
+    VkResult Res = VK.vkGetSemaphoreCounterValue(Device, Done, &Reached);
+    if (Res != VK_SUCCESS) {
+        if (Res == VK_ERROR_DEVICE_LOST)
+            Lost = true;
+        return Lost ? WaitResult::DeviceLost : WaitResult::Incomplete;
+    }
+    if (Reached > Submitted) {
+        Lost = true;
+        return WaitResult::DeviceLost;
+    }
+    return WaitResult::Drained;
+}
+
 void BSGpuHasher::Impl::RetireCompleted() {
-    uint64_t Completed = 0;
-    if (!Done || VK.vkGetSemaphoreCounterValue(Device, Done, &Completed) != VK_SUCCESS)
+    if (!Done)
         return;
+    uint64_t Completed = 0;
+    VkResult Res = VK.vkGetSemaphoreCounterValue(Device, Done, &Completed);
+    if (Res != VK_SUCCESS) {
+        if (Res == VK_ERROR_DEVICE_LOST)
+            Lost = true;
+        return;
+    }
+    /* The reset sentinel: a counter past everything ever submitted means nothing is executing,
+       so every context may be released. Read as ordinary completion it would hand out stale
+       results as finished work. */
+    if (Completed > Submitted) {
+        Lost = true;
+        for (auto &C : Contexts)
+            RetireContext(C);
+        return;
+    }
     for (auto &C : Contexts)
         if (C.Value && C.Value <= Completed)
             RetireContext(C);
@@ -359,6 +432,8 @@ void BSGpuHasher::Impl::RetireCompleted() {
 
 BSGpuHasher::Impl::ExecContext &BSGpuHasher::Impl::AcquireContext() {
     RetireCompleted();
+    if (Lost)
+        throw BestSourceHWDecoderException("GPU hashing: the GPU device was reset");
     ExecContext *Oldest = nullptr;
     for (auto &C : Contexts) {
         if (!C.Value)
@@ -367,34 +442,43 @@ BSGpuHasher::Impl::ExecContext &BSGpuHasher::Impl::AcquireContext() {
             Oldest = &C;
     }
 
-    VkSemaphoreWaitInfo SWI = {};
-    SWI.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
-    SWI.semaphoreCount = 1;
-    SWI.pSemaphores = &Done;
-    SWI.pValues = &Oldest->Value;
-    VkResult Res = VK.vkWaitSemaphores(Device, &SWI, UINT64_MAX);
-    if (Res != VK_SUCCESS)
-        ThrowVk("vkWaitSemaphores", Res);
-    RetireContext(*Oldest);
-    return *Oldest;
+    switch (WaitDone(Oldest->Value)) {
+    case WaitResult::Drained:
+        RetireContext(*Oldest);
+        return *Oldest;
+    case WaitResult::DeviceLost:
+        /* Nothing is executing any more, so every context may be released; the failure is
+           reported instead of recording work for a dead device. */
+        for (auto &C : Contexts)
+            RetireContext(C);
+        throw BestSourceHWDecoderException("GPU hashing: the GPU device was reset");
+    default:
+        /* The oldest submission may still be running, so nothing it holds may be released. */
+        throw BestSourceHWDecoderException("GPU hashing: waiting for earlier GPU work failed");
+    }
 }
 
-void BSGpuHasher::Impl::FinishAll() {
-    if (Done && Submitted) {
-        VkSemaphoreWaitInfo SWI = {};
-        SWI.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
-        SWI.semaphoreCount = 1;
-        SWI.pSemaphores = &Done;
-        SWI.pValues = &Submitted;
-        (void)VK.vkWaitSemaphores(Device, &SWI, UINT64_MAX);
-    }
-    for (auto &C : Contexts)
-        RetireContext(C);
+bool BSGpuHasher::Impl::FinishAll() {
+    bool Safe = true;
+    if (Done && Submitted)
+        Safe = (WaitDone(Submitted) != WaitResult::Incomplete);
+    if (Safe)
+        for (auto &C : Contexts)
+            RetireContext(C);
+    return Safe;
 }
 
 BSGpuHasher::Impl::~Impl() {
     if (Device) {
-        FinishAll();
+        /* Device objects go only when the drain established the GPU is done with them --
+           completion, or a reset after which nothing is executing. Otherwise they are
+           deliberately leaked to the device's own teardown, which is FFmpeg's and outlives
+           this; destroying what a live dispatch may still be using is the worse outcome. */
+        if (!FinishAll()) {
+            BSDebugPrint("GPU hashing: leaking device objects, couldn't establish the GPU finished with them");
+            av_buffer_unref(&DeviceRef);
+            return;
+        }
         for (auto &C : Contexts)
             if (C.CmdPool)
                 VK.vkDestroyCommandPool(Device, C.CmdPool, HWCtx->alloc);
@@ -980,14 +1064,19 @@ uint64_t BSGpuHasher::Impl::RunDispatch(const DispatchSource *Sources, int NumSo
         /* Only the hash has to come back to the host. An export is complete for its consumer when
            the semaphores say so, and its context waits for that in the background. */
         if (!DoExport) {
-            VkSemaphoreWaitInfo SWI = {};
-            SWI.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
-            SWI.semaphoreCount = 1;
-            SWI.pSemaphores = &P->Done;
-            SWI.pValues = &C.Value;
-            Res = P->VK.vkWaitSemaphores(P->Device, &SWI, UINT64_MAX);
-            if (Res != VK_SUCCESS)
-                ThrowVk("vkWaitSemaphores", Res);
+            switch (P->WaitDone(C.Value)) {
+            case Impl::WaitResult::Drained:
+                break;
+            case Impl::WaitResult::DeviceLost:
+                /* Releasing the context is safe -- nothing is executing -- but the accumulator
+                   holds whatever it held before, so there is no hash to return. */
+                P->RetireContext(C);
+                throw BestSourceHWDecoderException("GPU hashing: the GPU device was reset before the hash completed");
+            default:
+                /* Possibly still running: the context stays claimed, exactly as the catch
+                   below leaves it. */
+                throw BestSourceHWDecoderException("GPU hashing: waiting for the hash failed");
+            }
 
             const uint32_t *Lanes = static_cast<const uint32_t *>(P->Acc.Mapped);
             Result = (static_cast<uint64_t>(Lanes[1]) << 32) | Lanes[0];
@@ -1047,9 +1136,9 @@ void BSGpuHasher::ExportMergedFieldsAsPlanarGPU(const AVFrame *EvenRows, const A
     (void)P->RunDispatch(&Odd, 1, Width, Height, Targets, SignalTimeline, SignalValue);
 }
 
-void BSGpuHasher::FinishExports() {
+bool BSGpuHasher::FinishExports() {
     std::lock_guard<std::mutex> Lock(P->Mutex);
-    P->FinishAll();
+    return P->FinishAll();
 }
 
 #else /* !BS_GPU */

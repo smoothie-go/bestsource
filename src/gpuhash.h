@@ -121,17 +121,23 @@ public:
     /* The RFF form: writes the even rows of the output from EvenRows and the odd rows from OddRows,
        which is what MergeField produces on the CPU. The two frames must agree on format and size.
 
-       One submission, two dispatches, writing disjoint rows of the same destination. Neither source
-       is modified, which is the point -- on a device resident frame the images belong to FFmpeg's
-       pool and merging into one of them would corrupt it for every other holder. */
+       Two submissions, one per source frame, writing disjoint rows of the same destination, so
+       only one frame's lock is ever held; the consumer's timeline is signalled by the second,
+       whose completion on the shared queue implies the first's. Neither source is modified,
+       which is the point -- on a device resident frame the images belong to FFmpeg's pool and
+       merging into one of them would corrupt it for every other holder. */
     void ExportMergedFieldsAsPlanarGPU(const AVFrame *EvenRows, const AVFrame *OddRows,
         int Width, int Height, const BSGpuPlaneTarget *Targets,
         VkSemaphore SignalTimeline, uint64_t SignalValue);
 
-    /* Waits for every export still in flight and releases what it held. A plane target's buffer
-       may only be freed after this, since an export may still be writing it; beyond that it is
-       only needed at teardown, which the destructor does itself. */
-    void FinishExports();
+    /* Waits for every export still in flight and, when that is safe, releases what it held.
+       Returns whether the release happened: true after a completed wait or after a device
+       reset, where nothing is executing any more -- the rule VapourSynth's
+       vsGPUDrainSafeToDestroy states -- and false when the wait failed with work possibly
+       still running, in which case nothing was released and a plane target's buffer must not
+       be freed either. Beyond gating target lifetime it is only needed at teardown, which the
+       destructor does itself. */
+    bool FinishExports();
 #endif
 
     /* Whether the frame's format and residency are something HashFrame can handle. */

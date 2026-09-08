@@ -145,10 +145,14 @@ void CloseExportedHandle(intptr_t Handle, bool ImportSucceeded) {
 } // namespace
 
 BSVSGpuExport::Impl::~Impl() {
-    /* An export in flight may still be writing one of the imported buffers freed below. */
+    /* An export in flight may still be writing one of the imported buffers freed below, so
+       they are freed only when the drain says that is safe: completed, or a reset after which
+       nothing is executing. Otherwise they are deliberately leaked -- freeing memory a live
+       dispatch may still write is the worse outcome. */
+    bool Safe = true;
     if (Hasher)
-        Hasher->FinishExports();
-    if (Device) {
+        Safe = Hasher->FinishExports();
+    if (Device && Safe) {
         for (auto &Iter : Imports) {
             if (Iter.second.Buffer)
                 VK.vkDestroyBuffer(Device, Iter.second.Buffer, HWCtx->alloc);
@@ -157,6 +161,8 @@ BSVSGpuExport::Impl::~Impl() {
         }
         if (ImportedTimeline)
             VK.vkDestroySemaphore(Device, ImportedTimeline, HWCtx->alloc);
+    } else if (Device) {
+        BSDebugPrint("GPU export: leaking imported allocations, couldn't establish the GPU finished with them");
     }
     if (Timeline && VkAPI)
         VkAPI->freeGPUTimeline(Timeline);
@@ -254,9 +260,10 @@ VkBuffer BSVSGpuExport::Impl::ImportAllocation(const VSVulkanExportedMemory &Exp
        enough for the wait to cost nothing in practice. What the wait cannot cover is the current
        frame's other planes, imported moments ago and about to be handed to the same dispatch --
        the recency guard keeps those out of reach, with room to spare against the three planes a
-       frame can have. */
-    if (Imports.size() >= MaxImports)
-        Hasher->FinishExports();
+       frame can have. A drain that cannot be established leaves the victim possibly still
+       being written, so the import is refused instead of freeing one under a live dispatch. */
+    if (Imports.size() >= MaxImports && !Hasher->FinishExports())
+        throw BestSourceException("GPU export: couldn't establish that in-flight exports finished");
     while (Imports.size() >= MaxImports) {
         auto Victim = Imports.end();
         for (auto It = Imports.begin(); It != Imports.end(); ++It) {
