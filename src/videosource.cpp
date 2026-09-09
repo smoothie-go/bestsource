@@ -1445,6 +1445,10 @@ void BestVideoSource::UpdateAutoPreRoll() {
         FrameCache.SetMaxFrames(static_cast<size_t>(PreRoll + 2));
 }
 
+void BestVideoSource::SetCancellationCallback(CancellationFunction Callback) {
+    CancelPoint.Set(std::move(Callback));
+}
+
 void BestVideoSource::SetSeekPreRoll(int64_t Frames) {
     if (Frames < 0) {
         PreRollIsDefault = true;
@@ -1949,6 +1953,7 @@ BestVideoFrame *BestVideoSource::GetFrameLinearInternal(int64_t N, int64_t SeekF
     BestVideoFrame *RetFrame = nullptr;
 
     while (Decoder && Decoder->GetFrameNumber() <= N && Decoder->HasMoreFrames()) {
+        CancelPoint.ThrowIfCancelled();
         int64_t FrameNumber = Decoder->GetFrameNumber();
         if (FrameNumber >= N - PreRoll) {
             AVFrame *Frame = Decoder->GetNextFrame();

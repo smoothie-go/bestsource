@@ -198,6 +198,7 @@ private:
        cumulative sample start per selected frame (size+1, last = total). Both empty is the
        identity mapping. See BuildSelectedFrameMapping. */
     std::vector<int64_t> SelectedFrames;
+    CancellationPoint CancelPoint;
     std::vector<int64_t> SelectedSampleStart;
     int Threads;
     bool LinearMode = false;
@@ -242,6 +243,7 @@ public:
     [[nodiscard]] int GetTrack() const; // Useful when opening nth video track to get the actual number
     void SetMaxCacheSize(size_t Bytes); /* default max size is 1GB */
     void SetSeekPreRoll(int64_t Frames); /* the number of frames to cache before the position being fast forwarded to */
+    void SetCancellationCallback(CancellationFunction Callback);
     double GetRelativeStartTime(int Track) const;
     [[nodiscard]] const BSAudioProperties &GetAudioProperties() const;
     [[nodiscard]] const std::vector<FormatSet> &GetFormatSets() const; /* Get a listing of all the number of formats  */

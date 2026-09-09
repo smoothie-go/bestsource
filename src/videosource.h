@@ -351,6 +351,7 @@ private:
     /* Selected frame number -> position in TrackIndex.Frames; empty is the identity mapping.
        See BuildSelectedFrameMapping. */
     std::vector<int64_t> SelectedFrames;
+    CancellationPoint CancelPoint;
     int ViewID;
     int Threads;
     bool CanSeekByTime = true;
@@ -403,6 +404,7 @@ public:
        Null when not hardware decoding. */
     [[nodiscard]] AVBufferRef *GetHWDeviceContext() const;
     void SetSeekPreRoll(int64_t Frames); /* The number of frames to cache before the position being fast forwarded to; negative returns to the automatic default, which is capped so the window fits in 80% of the cache size */
+    void SetCancellationCallback(CancellationFunction Callback);
     [[nodiscard]] const BSVideoProperties &GetVideoProperties() const;
     [[nodiscard]] const std::vector<FormatSet> &GetFormatSets() const; /* Get a listing of all the number of formats  */
     void SelectFormatSet(int Index); /* Sets the output format to the specified format set, passing -1 means the default variable format will be used */

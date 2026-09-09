@@ -273,6 +273,16 @@ bool ReadBSHeader(file_ptr_t &F, bool Video) {
         ReadCompareInt(F, avcodec_version());
 }
 
+void CancellationPoint::Set(CancellationFunction Callback) {
+    std::atomic_store(&Fn, Callback ? std::make_shared<const CancellationFunction>(std::move(Callback)) : nullptr);
+}
+
+void CancellationPoint::ThrowIfCancelled() const {
+    std::shared_ptr<const CancellationFunction> Callback = std::atomic_load(&Fn);
+    if (Callback && (*Callback)())
+        throw BestSourceCancelledException("Request abandoned by the cancellation callback");
+}
+
 bool CloseWrittenFile(file_ptr_t &F) {
     FILE *fp = F.release();
     if (!fp)

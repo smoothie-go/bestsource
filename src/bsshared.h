@@ -40,6 +40,10 @@ class BestSourceHWDecoderException : public BestSourceException {
     using BestSourceException::BestSourceException;
 };
 
+class BestSourceCancelledException : public BestSourceException {
+    using BestSourceException::BestSourceException;
+};
+
 // FIXME, technically undefined behavior since FILE isn't a user defined type
 namespace std {
     template<>
@@ -53,6 +57,16 @@ namespace std {
 typedef std::unique_ptr<FILE> file_ptr_t;
 
 typedef std::function<bool(int Track, int64_t Current, int64_t Total)> ProgressFunction;
+
+typedef std::function<bool()> CancellationFunction;
+
+class CancellationPoint {
+private:
+    std::shared_ptr<const CancellationFunction> Fn;
+public:
+    void Set(CancellationFunction Callback);
+    void ThrowIfCancelled() const;
+};
 
 enum BestCacheMode {
     bcmDisable = 0,
@@ -102,13 +116,6 @@ bool ReadBSHeader(file_ptr_t &F, bool Video);
 bool PlausibleRecordCount(file_ptr_t &F, int64_t Count, size_t MinRecordBytes);
 bool CloseWrittenFile(file_ptr_t &F);
 
-/* Maps a selected format set's frame numbers to positions in the full track index. Choosing one
-   set out of several drops the other frames, so the selected numbering the caller uses no longer
-   lines up with the index; this records the correspondence once, when the set is selected, so
-   every lookup is O(1) and every caller agrees on it instead of rescanning the whole index (and
-   disagreeing about which numbering it produced). Returned empty when there is nothing to remap
-   -- no selection, or a single format set -- which callers read as the identity mapping. Match
-   decides which index frames belong to the selected set. */
 template<typename FrameVec, typename MatchFn>
 std::vector<int64_t> BuildSelectedFrameMapping(const FrameVec &Frames, bool Active, MatchFn Match) {
     std::vector<int64_t> Map;

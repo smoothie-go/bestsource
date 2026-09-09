@@ -413,6 +413,10 @@ void BestAudioSource::SetMaxCacheSize(size_t Bytes) {
     FrameCache.SetMaxSize(Bytes);
 }
 
+void BestAudioSource::SetCancellationCallback(CancellationFunction Callback) {
+    CancelPoint.Set(std::move(Callback));
+}
+
 void BestAudioSource::SetSeekPreRoll(int64_t Frames) {
     PreRoll = std::max<int64_t>(Frames, 0);
 }
@@ -856,6 +860,7 @@ BestAudioFrame *BestAudioSource::GetFrameLinearInternal(int64_t N, int64_t SeekF
     BestAudioFrame *RetFrame = nullptr;
 
     while (Decoder && Decoder->GetFrameNumber() <= N && Decoder->HasMoreFrames()) {
+        CancelPoint.ThrowIfCancelled();
         int64_t FrameNumber = Decoder->GetFrameNumber();
         if (FrameNumber >= N - PreRoll) {
             AVFrame *Frame = Decoder->GetNextFrame();
