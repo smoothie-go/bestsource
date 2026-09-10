@@ -130,13 +130,16 @@ namespace {
 
 /* NT handles are not consumed by a successful import and have to be closed; POSIX file descriptors
    are consumed on success and must only be closed when the import failed. Getting this backwards
-   leaks a handle per frame in one direction and double closes in the other. */
-void CloseExportedHandle(intptr_t Handle, bool ImportSucceeded) {
+   leaks a handle per frame in one direction and double closes in the other. Owned says the
+   handle is an NT handle at all: a KMT handle is a bare identifier nobody closes, and closing
+   it would close whatever else happened to carry that value. */
+void CloseExportedHandle(intptr_t Handle, bool ImportSucceeded, bool Owned) {
 #ifdef _WIN32
     (void)ImportSucceeded;
-    if (Handle)
+    if (Handle && Owned)
         CloseHandle(reinterpret_cast<HANDLE>(Handle));
 #else
+    (void)Owned;
     if (!ImportSucceeded && Handle >= 0)
         close(static_cast<int>(Handle));
 #endif
@@ -173,7 +176,7 @@ VkBuffer BSVSGpuExport::Impl::ImportAllocation(const VSVulkanExportedMemory &Exp
     auto Existing = Imports.find(Exported.memoryId);
     if (Existing != Imports.end()) {
         Existing->second.LastUse = ++ImportUseCounter;
-        CloseExportedHandle(Exported.handle, false);
+        CloseExportedHandle(Exported.handle, false, Exported.handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT);
         return Existing->second.Buffer;
     }
 
@@ -195,7 +198,7 @@ VkBuffer BSVSGpuExport::Impl::ImportAllocation(const VSVulkanExportedMemory &Exp
     BCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VkResult Res = VK.vkCreateBuffer(Device, &BCI, HWCtx->alloc, &New.Buffer);
     if (Res != VK_SUCCESS) {
-        CloseExportedHandle(Exported.handle, false);
+        CloseExportedHandle(Exported.handle, false, Exported.handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT);
         ThrowVk("vkCreateBuffer", Res);
     }
 
@@ -206,7 +209,7 @@ VkBuffer BSVSGpuExport::Impl::ImportAllocation(const VSVulkanExportedMemory &Exp
        cannot be bound to it, and finding out here beats an invalid bind. */
     if (Req.size > Exported.memorySize) {
         VK.vkDestroyBuffer(Device, New.Buffer, HWCtx->alloc);
-        CloseExportedHandle(Exported.handle, false);
+        CloseExportedHandle(Exported.handle, false, Exported.handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT);
         throw BestSourceException("GPU export: the imported allocation is smaller than the buffer's memory requirements");
     }
 
@@ -218,7 +221,7 @@ VkBuffer BSVSGpuExport::Impl::ImportAllocation(const VSVulkanExportedMemory &Exp
        whose requirements have to admit that type. */
     if (Exported.memoryTypeIndex >= VK_MAX_MEMORY_TYPES || !(Req.memoryTypeBits & (1u << Exported.memoryTypeIndex))) {
         VK.vkDestroyBuffer(Device, New.Buffer, HWCtx->alloc);
-        CloseExportedHandle(Exported.handle, false);
+        CloseExportedHandle(Exported.handle, false, Exported.handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT);
         throw BestSourceException("GPU export: the buffer can't be bound to memory of the exported allocation's type");
     }
 
@@ -241,7 +244,7 @@ VkBuffer BSVSGpuExport::Impl::ImportAllocation(const VSVulkanExportedMemory &Exp
     AI.memoryTypeIndex = Exported.memoryTypeIndex;
     Res = VK.vkAllocateMemory(Device, &AI, HWCtx->alloc, &New.Memory);
     Succeeded = (Res == VK_SUCCESS);
-    CloseExportedHandle(Exported.handle, Succeeded);
+    CloseExportedHandle(Exported.handle, Succeeded, Exported.handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT);
     if (!Succeeded) {
         VK.vkDestroyBuffer(Device, New.Buffer, HWCtx->alloc);
         ThrowVk("vkAllocateMemory (import)", Res);
@@ -262,8 +265,12 @@ VkBuffer BSVSGpuExport::Impl::ImportAllocation(const VSVulkanExportedMemory &Exp
        the recency guard keeps those out of reach, with room to spare against the three planes a
        frame can have. A drain that cannot be established leaves the victim possibly still
        being written, so the import is refused instead of freeing one under a live dispatch. */
-    if (Imports.size() >= MaxImports && !Hasher->FinishExports())
+    if (Imports.size() >= MaxImports && !Hasher->FinishExports()) {
+        /* Never handed to a dispatch, so releasing it is safe whatever the drain found. */
+        VK.vkDestroyBuffer(Device, New.Buffer, HWCtx->alloc);
+        VK.vkFreeMemory(Device, New.Memory, HWCtx->alloc);
         throw BestSourceException("GPU export: couldn't establish that in-flight exports finished");
+    }
     while (Imports.size() >= MaxImports) {
         auto Victim = Imports.end();
         for (auto It = Imports.begin(); It != Imports.end(); ++It) {
@@ -412,7 +419,7 @@ std::unique_ptr<BSVSGpuExport> BSVSGpuExport::Create(BestVideoSource *Source, in
     SemInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
     SemInfo.pNext = &TypeInfo;
     if (P->VK.vkCreateSemaphore(P->Device, &SemInfo, P->HWCtx->alloc, &P->ImportedTimeline) != VK_SUCCESS) {
-        CloseExportedHandle(ExportedSem.handle, false);
+        CloseExportedHandle(ExportedSem.handle, false, ExportedSem.handleType == VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT);
         Error = "couldn't create a semaphore to import the timeline into";
         return nullptr;
     }
@@ -432,7 +439,7 @@ std::unique_ptr<BSVSGpuExport> BSVSGpuExport::Create(BestVideoSource *Source, in
     SemImport.fd = static_cast<int>(ExportedSem.handle);
     const VkResult SemRes = P->VK.vkImportSemaphoreFdKHR(P->Device, &SemImport);
 #endif
-    CloseExportedHandle(ExportedSem.handle, SemRes == VK_SUCCESS);
+    CloseExportedHandle(ExportedSem.handle, SemRes == VK_SUCCESS, ExportedSem.handleType == VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT);
     if (SemRes != VK_SUCCESS) {
         Error = "couldn't import the timeline into the decoder's device";
         return nullptr;
@@ -463,6 +470,7 @@ VSFrame *BSVSGpuExport::ExportFrame(const BestVideoFrame *Src, const VSVideoForm
 
             Targets[Plane].Buffer = P->ImportAllocation(Exported);
             Targets[Plane].Offset = Exported.offset;
+            Targets[Plane].Size = Exported.size;
             Targets[Plane].Stride = vsapi->getStride(Dst, Plane);
         }
 

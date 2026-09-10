@@ -49,6 +49,7 @@ struct AVFrame;
 struct BSGpuPlaneTarget {
     VkBuffer Buffer;
     uint64_t Offset;  /* bytes from the start of Buffer */
+    uint64_t Size;    /* bytes available from Offset: the plane's region, which every row written must fit in */
     ptrdiff_t Stride; /* bytes */
 };
 #endif

@@ -25,6 +25,7 @@
    not change shape with the build option. Only the implementation is conditional. */
 #if BS_GPU
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <mutex>
@@ -77,7 +78,7 @@ namespace {
     F(vkBeginCommandBuffer)                \
     F(vkEndCommandBuffer)                  \
     F(vkResetCommandPool)                  \
-    F(vkCmdPipelineBarrier)                \
+    F(vkCmdPipelineBarrier2)               \
     F(vkCmdFillBuffer)                     \
     F(vkCmdBindPipeline)                   \
     F(vkCmdBindDescriptorSets)             \
@@ -157,6 +158,13 @@ struct BSGpuHasher::Impl {
     VkDevice Device = VK_NULL_HANDLE;
     VulkanFunctions VK;
     VkPhysicalDeviceMemoryProperties MemProps = {};
+    /* What an export destination is bound against: the plane's offset is rounded down to this
+       alignment, and the range that leaves has to fit the storage buffer limit. */
+    VkDeviceSize StorageOffsetAlignment = 1;
+    uint32_t MaxStorageBufferRange = 0;
+    /* Whether the UINT reinterpretation views can be read as storage images at all, per sample
+       size; core Vulkan leaves that optional for these formats. */
+    bool ViewStorageSupported[2] = {};
 
     VkQueue Queue = VK_NULL_HANDLE;
     uint32_t QueueFamily = 0;
@@ -209,9 +217,9 @@ struct BSGpuHasher::Impl {
 
     MappedBuffer Acc, Dummy[3];
 
-    /* HashFrame submits to a queue FFmpeg may also be using and mutates shared descriptor and
-       command buffer state, so calls are serialized. Nothing is lost by it while the
-       implementation is synchronous. */
+    /* Every entry point takes this: the context ring, the Done timeline and the loss flag are
+       shared by hashes and exports alike, and a hash blocks while an export does not, so the
+       serialization is what keeps one caller's claim on a context from being another's. */
     std::mutex Mutex;
 
     ~Impl();
@@ -563,6 +571,33 @@ BSGpuHasher::BSGpuHasher(AVBufferRef *HWDeviceContext) : P(new Impl) {
         throw BestSourceHWDecoderException("GPU hashing: couldn't load vkGetPhysicalDeviceMemoryProperties");
     GetMemProps(P->HWCtx->phys_dev, &P->MemProps);
 
+    auto GetProps = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+        P->HWCtx->get_proc_addr(P->HWCtx->inst, "vkGetPhysicalDeviceProperties"));
+    auto GetFormatProps = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties>(
+        P->HWCtx->get_proc_addr(P->HWCtx->inst, "vkGetPhysicalDeviceFormatProperties"));
+    if (!GetProps || !GetFormatProps)
+        throw BestSourceHWDecoderException("GPU hashing: couldn't load the physical device property queries");
+    VkPhysicalDeviceProperties Props = {};
+    GetProps(P->HWCtx->phys_dev, &Props);
+    P->StorageOffsetAlignment = std::max<VkDeviceSize>(1, Props.limits.minStorageBufferOffsetAlignment);
+    P->MaxStorageBufferRange = Props.limits.maxStorageBufferRange;
+
+    /* Storage image support for the UINT views the shader reads through is optional in core
+       Vulkan for these formats, and reading through an unsupported one is undefined rather than
+       an error -- it would surface as hashes that match nothing. Recorded per sample size and
+       checked at dispatch, where a refusal during indexing is what routes the source to the
+       CPU fallback. */
+    const VkFormat ViewFormats[2][2] = { { VK_FORMAT_R8_UINT, VK_FORMAT_R8G8_UINT }, { VK_FORMAT_R16_UINT, VK_FORMAT_R16G16_UINT } };
+    for (int Slot = 0; Slot < 2; Slot++) {
+        bool Ok = true;
+        for (int p = 0; p < 2; p++) {
+            VkFormatProperties FP = {};
+            GetFormatProps(P->HWCtx->phys_dev, ViewFormats[Slot][p], &FP);
+            Ok = Ok && (FP.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
+        }
+        P->ViewStorageSupported[Slot] = Ok;
+    }
+
     for (int i = 0; i < P->HWCtx->nb_qf; i++) {
         if (P->HWCtx->qf[i].flags & VK_QUEUE_COMPUTE_BIT) {
             P->QueueFamilyListIndex = i;
@@ -732,6 +767,8 @@ uint64_t BSGpuHasher::Impl::RunDispatch(const DispatchSource *Sources, int NumSo
     const int Depth = Desc->comp[0].depth;
     const int BytesPerSample = (Depth > 8) ? 2 : 1;
     const VkFormat *PlaneFmts = av_vkfmt_from_pixfmt(Frames->sw_format);
+    if (!P->ViewStorageSupported[BytesPerSample == 2 ? 1 : 0])
+        throw BestSourceHWDecoderException("GPU hashing: this device can't read the decoder's image format as a storage image");
 
     /* One source per dispatch: a field merge issues two of these instead of locking two frames
        at once. Holding at most one FFmpeg frame lock is what keeps this deadlock-free against the
@@ -754,27 +791,44 @@ uint64_t BSGpuHasher::Impl::RunDispatch(const DispatchSource *Sources, int NumSo
         OriginX, OriginY, OriginX >> Desc->log2_chroma_w, OriginY >> Desc->log2_chroma_h
     };
 
+    /* Where each destination is bound: from the plane's offset rounded down to the storage buffer
+       offset alignment, for the residual plus the plane's region. Bound whole from the start of
+       the allocation instead, the range would be the allocation -- the consumer's are 128 MiB
+       blocks, which is exactly the range core Vulkan guarantees, and a plane bigger than a block
+       gets a bigger block. The plane's own offset need not meet the alignment, since an
+       allocation imported from another device was laid out without it; the residual is carried
+       in the push constants. */
+    VkDeviceSize BindBase[3] = {};
+    VkDeviceSize BindRange[3] = {};
     if (DoExport) {
         for (int i = 0; i < 3; i++) {
             if (Targets[i].Stride <= 0)
                 throw BestSourceHWDecoderException("GPU export: plane stride must be positive");
             if (Targets[i].Stride % BytesPerSample || Targets[i].Offset % BytesPerSample)
                 throw BestSourceHWDecoderException("GPU export: plane stride and offset must be a whole number of samples");
-            /* The shader addresses samples with int32 arithmetic, so a plane sitting deep inside a
-               large shared allocation must be rejected rather than have its offset wrap negative
-               and the writes land somewhere unrelated in the buffer. The bound covers the last
-               sample the plane can touch, not just its first. */
+            /* Every row written has to fit the region the consumer says is there. */
             const int PlaneRows = (i == 0) ? Height : AV_CEIL_RSHIFT(Height, Desc->log2_chroma_h);
-            const int64_t LastSample = static_cast<int64_t>(Targets[i].Offset / BytesPerSample) +
+            const int PlaneCols = (i == 0) ? Width : AV_CEIL_RSHIFT(Width, Desc->log2_chroma_w);
+            const uint64_t Needed = static_cast<uint64_t>(PlaneRows - 1) * static_cast<uint64_t>(Targets[i].Stride) +
+                static_cast<uint64_t>(PlaneCols) * BytesPerSample;
+            if (Needed > Targets[i].Size)
+                throw BestSourceHWDecoderException("GPU export: plane destination is smaller than the plane");
+            BindBase[i] = Targets[i].Offset - (Targets[i].Offset % P->StorageOffsetAlignment);
+            BindRange[i] = (Targets[i].Offset - BindBase[i]) + Targets[i].Size;
+            if (BindRange[i] > P->MaxStorageBufferRange)
+                throw BestSourceHWDecoderException("GPU export: plane destination exceeds the device's storage buffer range");
+            /* The shader addresses samples with int32 arithmetic; the bound covers the last sample
+               the plane can touch, not just its first. */
+            const int64_t LastSample = static_cast<int64_t>((Targets[i].Offset - BindBase[i]) / BytesPerSample) +
                 static_cast<int64_t>(PlaneRows) * (Targets[i].Stride / BytesPerSample);
             if (LastSample > INT32_MAX)
                 throw BestSourceHWDecoderException("GPU export: plane offset and extent exceed the shader's addressable range");
         }
         PC.StrideY = static_cast<int32_t>(Targets[0].Stride / BytesPerSample);
         PC.StrideUV = static_cast<int32_t>(Targets[1].Stride / BytesPerSample);
-        PC.OffsetY = static_cast<int32_t>(Targets[0].Offset / BytesPerSample);
-        PC.OffsetU = static_cast<int32_t>(Targets[1].Offset / BytesPerSample);
-        PC.OffsetV = static_cast<int32_t>(Targets[2].Offset / BytesPerSample);
+        PC.OffsetY = static_cast<int32_t>((Targets[0].Offset - BindBase[0]) / BytesPerSample);
+        PC.OffsetU = static_cast<int32_t>((Targets[1].Offset - BindBase[1]) / BytesPerSample);
+        PC.OffsetV = static_cast<int32_t>((Targets[2].Offset - BindBase[2]) / BytesPerSample);
         if (Targets[1].Stride != Targets[2].Stride)
             throw BestSourceHWDecoderException("GPU export: the two chroma planes must share a stride");
         /* The P010 family stores samples MSB aligned in a 16 bit container while planar output
@@ -857,10 +911,9 @@ uint64_t BSGpuHasher::Impl::RunDispatch(const DispatchSource *Sources, int NumSo
         }
         P->VK.vkUpdateDescriptorSets(P->Device, NumSources * 2, Writes, 0, nullptr);
 
-        /* Destination buffers are bound whole, at offset 0, with the plane offsets carried in the
-           push constants instead. Binding at the plane offset would have to satisfy
-           minStorageBufferOffsetAlignment, which an allocation imported from another device has no
-           reason to meet. Every source writes into the same destination, so every set gets them.
+        /* Destinations are bound from the aligned base worked out above, with the residual to the
+           plane carried in the push constants. Every source writes into the same destination, so
+           every set gets them.
 
            The hash pass rebinds them to the dummy buffers rather than leaving the set naming the
            last export's destination, which belongs to the consumer and can be freed at any time.
@@ -871,7 +924,8 @@ uint64_t BSGpuHasher::Impl::RunDispatch(const DispatchSource *Sources, int NumSo
         VkWriteDescriptorSet DstWrites[MaxDispatchSources * 3] = {};
         for (int i = 0; i < 3; i++) {
             DstInfo[i].buffer = DoExport ? Targets[i].Buffer : P->Dummy[i].Buffer;
-            DstInfo[i].range = VK_WHOLE_SIZE;
+            DstInfo[i].offset = DoExport ? BindBase[i] : 0;
+            DstInfo[i].range = DoExport ? BindRange[i] : VK_WHOLE_SIZE;
             for (int s = 0; s < NumSources; s++) {
                 VkWriteDescriptorSet &W = DstWrites[s * 3 + i];
                 W.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -907,11 +961,17 @@ uint64_t BSGpuHasher::Impl::RunDispatch(const DispatchSource *Sources, int NumSo
            VK_QUEUE_FAMILY_IGNORED because FFmpeg allocates CONCURRENT, so there is no ownership
            transfer to perform. */
         LockFrames();
-        VkImageMemoryBarrier ImgBar[MaxDispatchSources] = {};
+        VkImageMemoryBarrier2 ImgBar[MaxDispatchSources] = {};
         for (int s = 0; s < NumSources; s++) {
-            ImgBar[s].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            ImgBar[s].srcAccessMask = static_cast<VkAccessFlags>(Vkf[s]->access[0]);
-            ImgBar[s].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            ImgBar[s].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+            /* Synchronization2, because AVVkFrame keeps its access as the 64 bit VkAccessFlags2 the
+               video stages need -- the decode write bit sits above bit 32 -- and narrowing it to a
+               first generation barrier drops it silently. ALL_COMMANDS as the source stage, as in
+               FFmpeg's own frame barriers, admits whatever access the frame carries. */
+            ImgBar[s].srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            ImgBar[s].srcAccessMask = Vkf[s]->access[0];
+            ImgBar[s].dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            ImgBar[s].dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
             ImgBar[s].oldLayout = Vkf[s]->layout[0];
             ImgBar[s].newLayout = VK_IMAGE_LAYOUT_GENERAL;
             ImgBar[s].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -927,18 +987,24 @@ uint64_t BSGpuHasher::Impl::RunDispatch(const DispatchSource *Sources, int NumSo
             ImgBar[s].subresourceRange.layerCount = 1;
         }
 
-        VkBufferMemoryBarrier FillBar = {};
-        FillBar.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-        FillBar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        FillBar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        VkBufferMemoryBarrier2 FillBar = {};
+        FillBar.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+        FillBar.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        FillBar.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        FillBar.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        FillBar.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
         FillBar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         FillBar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         FillBar.buffer = P->Acc.Buffer;
         FillBar.size = VK_WHOLE_SIZE;
 
-        P->VK.vkCmdPipelineBarrier(C.Cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, DoExport ? 0 : 1, &FillBar,
-            static_cast<uint32_t>(NumSources), ImgBar);
+        VkDependencyInfo InDep = {};
+        InDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        InDep.bufferMemoryBarrierCount = DoExport ? 0 : 1;
+        InDep.pBufferMemoryBarriers = &FillBar;
+        InDep.imageMemoryBarrierCount = static_cast<uint32_t>(NumSources);
+        InDep.pImageMemoryBarriers = ImgBar;
+        P->VK.vkCmdPipelineBarrier2(C.Cmd, &InDep);
 
         P->VK.vkCmdBindPipeline(C.Cmd, VK_PIPELINE_BIND_POINT_COMPUTE, Pipe);
         /* Each workgroup covers 16 invocations of BS_GPU_SAMPLES_X samples along x. */
@@ -961,31 +1027,37 @@ uint64_t BSGpuHasher::Impl::RunDispatch(const DispatchSource *Sources, int NumSo
         /* The accumulator has to become host readable; the exported planes have to become visible
            to whatever reads them next, which may be another device picking them up after the
            semaphore signal, hence MEMORY_READ rather than anything narrower. */
-        VkBufferMemoryBarrier OutBars[3] = {};
+        VkBufferMemoryBarrier2 OutBars[3] = {};
         uint32_t NumOutBars = 0;
+        auto AddOutBar = [&](VkBuffer Buffer) {
+            VkBufferMemoryBarrier2 &B = OutBars[NumOutBars++];
+            B.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+            B.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            B.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            B.dstStageMask = DoExport ? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT : (VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+            B.dstAccessMask = DoExport ? VK_ACCESS_2_MEMORY_READ_BIT : VK_ACCESS_2_HOST_READ_BIT;
+            B.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            B.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            B.buffer = Buffer;
+            B.size = VK_WHOLE_SIZE;
+        };
         if (!DoExport) {
-            OutBars[NumOutBars] = FillBar;
-            OutBars[NumOutBars].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            OutBars[NumOutBars].dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-            NumOutBars++;
+            AddOutBar(P->Acc.Buffer);
         } else {
             for (int i = 0; i < 3; i++) {
                 /* Planes commonly share one buffer, so skip the duplicates. */
                 bool Seen = false;
                 for (int j = 0; j < i; j++)
                     Seen = Seen || (Targets[j].Buffer == Targets[i].Buffer);
-                if (Seen)
-                    continue;
-                OutBars[NumOutBars] = FillBar;
-                OutBars[NumOutBars].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-                OutBars[NumOutBars].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-                OutBars[NumOutBars].buffer = Targets[i].Buffer;
-                NumOutBars++;
+                if (!Seen)
+                    AddOutBar(Targets[i].Buffer);
             }
         }
-        P->VK.vkCmdPipelineBarrier(C.Cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            DoExport ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : (VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT),
-            0, 0, nullptr, NumOutBars, OutBars, 0, nullptr);
+        VkDependencyInfo OutDep = {};
+        OutDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        OutDep.bufferMemoryBarrierCount = NumOutBars;
+        OutDep.pBufferMemoryBarriers = OutBars;
+        P->VK.vkCmdPipelineBarrier2(C.Cmd, &OutDep);
 
         Res = P->VK.vkEndCommandBuffer(C.Cmd);
         if (Res != VK_SUCCESS)
