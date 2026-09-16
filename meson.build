@@ -129,7 +129,7 @@ endif
 
 if enable_plugin
     # Needs the API 4.3 declarations the GPU frame path is written against, which VapourSynth
-    # ships from R80a1 onwards.
+    # ships from R80 onwards.
     incdir += include_directories(
         run_command(py, '-c', 'import vapoursynth as vs; print(vs.get_include())', check: true).stdout().strip(),
     )
