@@ -1,362 +1,191 @@
 name: Build
 
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+    branches: [master]
+    tags: ['R*', 'v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create GitHub release and attach binaries'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
 
 jobs:
-  build-non-windows-wheel:
+  build-linux:
     strategy:
       matrix:
         include:
-        - arch: linux_x86_64
-          runs-on: ubuntu-latest
-        - arch: linux_aarch64
-          runs-on: ubuntu-24.04-arm
-        - arch: macosx_x86_64
-          runs-on: macos-15-intel
-        - arch: macosx_arm64
-          runs-on: macos-15
+          - arch: linux_x86_64
+            runs-on: ubuntu-latest
+            container: 'ubuntu:22.04'
+          - arch: linux_aarch64
+            runs-on: ubuntu-24.04-arm
+            container: 'ubuntu:22.04'
       fail-fast: false
 
     runs-on: ${{ matrix.runs-on }}
-
-    steps:
-    - uses: actions/checkout@v7
-
-    - uses: pypa/cibuildwheel@v4.1.0
-      env:
-        CIBW_BUILD: cp314-*
-        CIBW_BUILD_FRONTEND: uv
-        CIBW_CONFIG_SETTINGS: setup-args="-Db_lto=true"
-        # Linux is the only cibuildwheel target that can do GPU decoding, so it is the only one
-        # that demands the feature rather than leaving it on auto -- a missing glslang or missing
-        # vulkan headers should fail here rather than silently ship a wheel without the GPU path.
-        # A platform specific value replaces the generic one outright, hence the repeated b_lto.
-        CIBW_CONFIG_SETTINGS_LINUX: setup-args="-Db_lto=true" setup-args="-Denable_gpu=enabled"
-        CIBW_ENVIRONMENT_MACOS: MACOSX_DEPLOYMENT_TARGET=15
-        # The vulkan headers come from source on both images because VSVulkan4.h is written against
-        # Vulkan 1.4 -- vkMapMemory2 and vkUnmapMemory2 are only core there, having been promoted
-        # from VK_KHR_map_memory2 -- and both distros still package 1.3.x. Headers only, so this
-        # is a configure and an install with nothing to compile. The loader package stays: it is
-        # what provides vulkan.pc for ffmpeg's --enable-vulkan check.
-        # glslang is packaged on Alpine but not on AlmaLinux 8, which has it in neither BaseOS,
-        # AppStream nor EPEL, and no prebuilt Khronos release covers aarch64. ENABLE_OPT=OFF is
-        # what lets cmake configure without first running update_glslang_sources.py to fetch
-        # SPIRV-Tools, which is only needed for spirv-opt. That build installs the binary as
-        # 'glslang' with a glslangValidator symlink, while Alpine's package installs only
-        # glslangValidator, which is why meson.build accepts either name.
-        # FFmpeg is built from master rather than a release branch on purpose: it carries several
-        # internal decoder bug fixes the release branches don't have yet. FFmpeg 9.0 is the
-        # minimum meson accepts; master satisfies it.
-        CIBW_BEFORE_ALL_LINUX: >
-          if command -v dnf >/dev/null 2>&1; then
-            dnf -y install cmake libjpeg-turbo-devel libjxl-devel libtiff-devel libxml2-devel meson nasm opus-devel vulkan-loader-devel xxhash-devel &&
-            git clone https://github.com/KhronosGroup/glslang.git --depth 1 &&
-            cmake -S glslang -B glslang/build -DCMAKE_BUILD_TYPE=Release -DENABLE_OPT=OFF -DGLSLANG_TESTS=OFF -DCMAKE_INSTALL_PREFIX=/usr &&
-            cmake --build glslang/build --target install -j$(nproc) &&
-            rm -rf glslang
-          else
-            apk add --no-cache cmake glslang libjpeg-turbo-dev libjxl-dev libxml2-dev meson nasm opus-dev tiff-dev vulkan-loader-dev xxhash-dev
-          fi &&
-          git clone https://github.com/KhronosGroup/Vulkan-Headers.git --depth 1 &&
-          cmake -S Vulkan-Headers -B Vulkan-Headers/build -DCMAKE_INSTALL_PREFIX=/usr &&
-          cmake --install Vulkan-Headers/build &&
-          rm -rf Vulkan-Headers &&
-          git clone https://github.com/videolan/dav1d.git --depth 1 &&
-          cd dav1d &&
-          meson setup build -Dprefix=/usr -Denable_tools=false -Denable_tests=false &&
-          meson compile -C build &&
-          meson install -C build &&
-          cd .. &&
-          rm -rf dav1d &&
-          git clone https://github.com/mm2/Little-CMS.git --depth 1 &&
-          cd Little-CMS &&
-          meson setup build -Dprefix=/usr -Dtests=disabled &&
-          meson compile -C build &&
-          meson install -C build &&
-          cd .. &&
-          rm -rf Little-CMS &&
-          git clone https://github.com/FFmpeg/FFmpeg.git --depth 1 &&
-          cd FFmpeg &&
-          ./configure --enable-gpl --enable-version3 --disable-programs --disable-doc --disable-avdevice --disable-swresample --disable-swscale --disable-avfilter --disable-encoders --disable-muxers --enable-lcms2 --enable-libdav1d --enable-libjxl --enable-libopus --enable-libxml2 --enable-vulkan --enable-pic --disable-debug &&
-          make -j$(nproc) &&
-          make install -j$(nproc) &&
-          cd .. &&
-          rm -rf FFmpeg
-        # No vulkan headers or glslang here on purpose. MoltenVK does not implement
-        # VK_KHR_video_decode_queue, so the GPU path could not work at runtime on macOS, and
-        # forcing --enable-vulkan would only risk failing the configure for nothing.
-        CIBW_BEFORE_ALL_MACOS: >
-          brew install dav1d jpeg-xl libxml2 little-cms2 nasm opus vulkan-loader xxhash &&
-          git clone https://github.com/FFmpeg/FFmpeg.git --depth 1 &&
-          cd FFmpeg &&
-          ./configure --enable-gpl --enable-version3 --disable-programs --disable-doc --disable-avdevice --disable-swresample --disable-swscale --disable-avfilter --disable-encoders --disable-muxers --enable-lcms2 --enable-libdav1d --enable-libjxl --enable-libopus --enable-libxml2 --enable-pic --disable-debug &&
-          make -j3 &&
-          sudo make install -j3 &&
-          cd .. &&
-          rm -rf FFmpeg
-      with:
-        output-dir: dist
-        extras: uv
-
-    - name: Fix tag
-      run: |
-        pipx run wheel tags --remove --python-tag py3 --abi-tag none dist/*.whl
-
-    - uses: actions/upload-artifact@v7
-      with:
-        name: bestsource-${{ matrix.arch }}
-        path: dist
-
-  build-windows-wheel:
-    runs-on: windows-latest
+    container: ${{ matrix.container }}
 
     defaults:
       run:
-        shell: msys2 {0}
+        shell: bash
 
     steps:
-    - uses: actions/checkout@v7
+      - name: Install minimal bootstrap tools
+        run: |
+          if [ "$(id -u)" -ne 0 ]; then SUDO="sudo"; else SUDO=""; fi
+          $SUDO apt-get update
+          DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y --no-install-recommends ca-certificates curl git
 
-    - uses: msys2/setup-msys2@v2
-      with:
-        msystem: CLANG64
-        update: true
-        pacboy: >-
-          autotools:p
-          cmake:p
-          dav1d:p
-          git:p
-          glslang:p
-          lcms2:p
-          libjxl:p
-          libxml2:p
-          nasm:p
-          ninja:p
-          opus:p
-          python-wheel:p
-          toolchain:p
-          uv:p
-          vulkan-headers:p
-          xxhash:p
+      - uses: actions/checkout@v7
 
-    - name: Install davs2
-      run: |
-        git clone https://github.com/pkuvcl/davs2.git --depth 1
-        pushd davs2/build/linux
-        CC=clang++ ./configure --prefix=/clang64 --disable-cli --enable-pic
-        make install -j$(nproc)
-        popd
-        rm -rf davs2
+      - name: Install system dependencies
+        run: |
+          if [ "$(id -u)" -ne 0 ]; then SUDO="sudo"; else SUDO=""; fi
+          DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y --no-install-recommends \
+            build-essential cmake nasm pkg-config ca-certificates curl git \
+            libvulkan-dev libxxhash-dev zlib1g-dev
 
-    - name: Install uavs3d
-      run: |
-        git clone https://github.com/uavs3/uavs3d.git --depth 1
-        pushd uavs3d
-        cmake -S . -B build -DCMAKE_POLICY_VERSION_MINIMUM=3.10 -DCOMPILE_10BIT=1 --install-prefix /clang64
-        ninja -C build install
-        popd
-        rm -rf uavs3d
+      - name: Setup Python 3.12 and build tools
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          uv venv --python 3.12 "$HOME/build-venv"
+          uv pip install --python "$HOME/build-venv" meson ninja "vapoursynth>=80a1"
+          echo "$HOME/build-venv/bin" >> "$GITHUB_PATH"
 
-    - name: Install XEVD
-      run: |
-        git clone https://github.com/mpeg5/xevd.git
-        pushd xevd
-        cmake -S . -B build --install-prefix /clang64
-        ninja -C build install
-        popd
-        rm -rf xevd
-        mv /clang64/lib/xevd/libxevd.a /clang64/lib
+      - name: Build and install Vulkan-Headers
+        run: |
+          if [ "$(id -u)" -ne 0 ]; then SUDO="sudo"; else SUDO=""; fi
+          git clone https://github.com/KhronosGroup/Vulkan-Headers.git --depth 1
+          cmake -S Vulkan-Headers -B Vulkan-Headers/build -DCMAKE_INSTALL_PREFIX=/usr
+          $SUDO cmake --install Vulkan-Headers/build
+          rm -rf Vulkan-Headers
 
-    # Master rather than a release branch for the same reason as the wheel builds: internal
-    # decoder bug fixes not yet in any release.
-    - name: Install FFmpeg
-      run: |
-        git clone https://github.com/FFmpeg/FFmpeg.git --depth 1
-        pushd FFmpeg
-        ./configure --prefix=/clang64 --enable-gpl --enable-version3 --disable-programs --disable-doc --disable-avdevice --disable-swresample --disable-swscale --disable-avfilter --disable-encoders --disable-muxers --enable-lcms2 --enable-libdav1d --enable-libdavs2 --enable-libjxl --enable-libopus --enable-libuavs3d --enable-libxevd --enable-libxml2 --enable-vulkan --cc=clang --cxx=clang++ --pkg-config-flags=--static --enable-pic --disable-debug
-        make install -j$(nproc)
-        popd
-        rm -rf FFmpeg
+      - name: Build and install glslang
+        run: |
+          if [ "$(id -u)" -ne 0 ]; then SUDO="sudo"; else SUDO=""; fi
+          git clone https://github.com/KhronosGroup/glslang.git --depth 1
+          cmake -S glslang -B glslang/build -DCMAKE_BUILD_TYPE=Release -DENABLE_OPT=OFF -DGLSLANG_TESTS=OFF -DCMAKE_INSTALL_PREFIX=/usr
+          cmake --build glslang/build -j$(nproc)
+          $SUDO cmake --install glslang/build
+          rm -rf glslang
 
-    - name: Build
-      run: |
-        uv build -Csetup-args="-Dprefer_static=true" -Csetup-args="-Db_lto=true" -Csetup-args="-Dcpp_link_args=-static" -Csetup-args="-Denable_avisynth=false" -Csetup-args="-Denable_gpu=enabled"
+      - name: Build and install dav1d (static)
+        run: |
+          if [ "$(id -u)" -ne 0 ]; then SUDO="sudo"; else SUDO=""; fi
+          git clone https://github.com/videolan/dav1d.git --depth 1
+          cd dav1d
+          meson setup build -Dprefix=/usr --default-library=static -Denable_tools=false -Denable_tests=false -Db_lto=true
+          meson compile -C build
+          $SUDO env "PATH=$PATH" "$HOME/build-venv/bin/meson" install -C build
+          cd ..
+          rm -rf dav1d
 
-    - name: Fix tag and strip dll
-      run: |
-        cd dist
-        wheel tags --remove --python-tag py3 --abi-tag none *.whl
-        wheel unpack --dest unpacked *.whl
-        rm *.whl
-        strip $(find . -name '*.dll')
-        wheel pack unpacked/*
+      - name: Build and install Little-CMS (static)
+        run: |
+          if [ "$(id -u)" -ne 0 ]; then SUDO="sudo"; else SUDO=""; fi
+          git clone https://github.com/mm2/Little-CMS.git --depth 1
+          cd Little-CMS
+          meson setup build -Dprefix=/usr --default-library=static -Dtests=disabled -Db_lto=true
+          meson compile -C build
+          $SUDO env "PATH=$PATH" "$HOME/build-venv/bin/meson" install -C build
+          cd ..
+          rm -rf Little-CMS
 
-    - uses: actions/upload-artifact@v7
-      with:
-        name: bestsource-sdist
-        path: dist/*.tar.gz
+      - name: Build and install FFmpeg (static master)
+        run: |
+          if [ "$(id -u)" -ne 0 ]; then SUDO="sudo"; else SUDO=""; fi
+          export PKG_CONFIG_PATH="/usr/lib/pkgconfig:/usr/lib/$(uname -m)-linux-gnu/pkgconfig:/usr/share/pkgconfig:$PKG_CONFIG_PATH"
+          git clone https://github.com/FFmpeg/FFmpeg.git --depth 1
+          cd FFmpeg
+          ./configure \
+            --prefix=/usr \
+            --enable-gpl \
+            --enable-version3 \
+            --disable-programs \
+            --disable-doc \
+            --disable-avdevice \
+            --disable-swresample \
+            --disable-swscale \
+            --disable-avfilter \
+            --disable-encoders \
+            --disable-muxers \
+            --disable-bzlib \
+            --disable-lzma \
+            --disable-xlib \
+            --enable-lcms2 \
+            --enable-libdav1d \
+            --enable-vulkan \
+            --enable-pic \
+            --enable-static \
+            --disable-shared \
+            --disable-debug
+          make -j$(nproc)
+          $SUDO make install -j$(nproc)
+          cd ..
+          rm -rf FFmpeg
 
-    - uses: actions/upload-artifact@v7
-      with:
-        name: bestsource-win_amd64
-        path: dist/*.whl
+      - name: Build BestSource
+        run: |
+          export PKG_CONFIG_PATH="/usr/lib/pkgconfig:/usr/lib/$(uname -m)-linux-gnu/pkgconfig:/usr/share/pkgconfig:$PKG_CONFIG_PATH"
+          meson setup build \
+            --buildtype=release \
+            -Db_ndebug=if-release \
+            -Db_lto=true \
+            -Denable_plugin=true \
+            -Denable_gpu=enabled \
+            -Denable_avisynth=true \
+            -Dprefer_static=true \
+            -Dcpp_link_args="-static-libstdc++ -static-libgcc"
+          meson compile -C build
+          strip --strip-unneeded build/libbestsource.so
 
-  build-windows-msvc:
-    runs-on: windows-latest
+      - name: Prepare standalone binary
+        run: |
+          mkdir -p output
+          cp build/libbestsource.so "output/libbestsource-${{ matrix.arch }}.so"
+          cp build/libbestsource.so output/libbestsource.so
 
-    env:
-      # x64-windows-static plus VCPKG_BUILD_TYPE release, shipped with vcpkg as a community
-      # triplet. Only the release configuration of each dependency is ever linked here, so
-      # building the debug one as well would roughly double the cold build for nothing.
-      VCPKG_TRIPLET: x64-windows-static-release
-      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-bincache
-
-    steps:
-    - uses: actions/checkout@v7
-
-    # Python is needed for meson itself, for tools/spv2c.py, which turns the compiled shaders into
-    # a header, and for the vs.get_include() lookup in meson.build. The VapourSynth wheel is
-    # limited-API (cp312-abi3), so any Python >= 3.12 can import it for that.
-    - uses: actions/setup-python@v6
-      with:
-        python-version: '3.14'
-
-    - uses: ilammy/msvc-dev-cmd@v1
-      with:
-        arch: x64
-
-    - name: Install build tools
-      run: pip install meson ninja "vapoursynth>=80a1"
-
-    - name: Prepare vcpkg binary cache
-      run: New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE
-
-    # A cold FFmpeg build here takes tens of minutes. vcpkg's binary cache is content addressed
-    # per package, so an older restore-keys hit still avoids rebuilding everything.
-    - uses: actions/cache@v4
-      with:
-        path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
-        key: vcpkg-${{ env.VCPKG_TRIPLET }}-${{ hashFiles('.github/workflows/build.yml') }}
-        restore-keys: vcpkg-${{ env.VCPKG_TRIPLET }}-
-
-    # vcpkg's ffmpeg port has no lcms2 feature, so --enable-lcms2 is patched into the configure
-    # options in place rather than carrying a forked copy of the port. Editing portfile.cmake
-    # changes the port's ABI hash, so the binary cache invalidates on its own instead of serving
-    # an ffmpeg built without it. The substitution is asserted because a silently missed anchor
-    # would just quietly drop ICC profile support.
-    - name: Enable lcms2 in the vcpkg ffmpeg port
-      run: |
-        $portfile = "$env:VCPKG_INSTALLATION_ROOT\ports\ffmpeg\portfile.cmake"
-        $old = Get-Content -Raw $portfile
-        $new = $old -replace '--disable-autodetect', '--disable-autodetect --enable-lcms2'
-        if ($new -eq $old) { throw "Anchor '--disable-autodetect' not found in $portfile" }
-        [System.IO.File]::WriteAllText($portfile, $new)
-
-    # Dependency set as documented in README.md. vcpkg's ffmpeg port has no feature for
-    # libjxl/libdavs2/libuavs3d/libxevd, so this build still decodes less than the CLANG64 one
-    # above.
-    - name: Install dependencies
-      # --vcpkg-root is passed explicitly because the developer environment set up above exports
-      # VCPKG_ROOT pointing at the vcpkg bundled with Visual Studio, which is not the one being
-      # used here. Without it vcpkg warns about the mismatch, and anything that does honour the
-      # variable would look in the wrong tree.
-      run: |
-        # lcms has to be built before ffmpeg. The patched port does not declare the dependency,
-        # and vcpkg is free to order two unrelated top level packages either way, so the separate
-        # invocation is what makes the order deterministic. --enable-lcms2 goes through
-        # require_pkg_config, so getting this wrong fails the ffmpeg configure loudly.
-        & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install --vcpkg-root "$env:VCPKG_INSTALLATION_ROOT" --triplet $env:VCPKG_TRIPLET lcms
-        & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install --vcpkg-root "$env:VCPKG_INSTALLATION_ROOT" --triplet $env:VCPKG_TRIPLET `
-          "ffmpeg[avcodec,avdevice,avfilter,avformat,swresample,swscale,zlib,bzip2,core,dav1d,gpl,version3,lzma,vulkan,openssl,xml2]" `
-          xxhash
-        & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install --vcpkg-root "$env:VCPKG_INSTALLATION_ROOT" --triplet $env:VCPKG_TRIPLET pkgconf
-
-    # enable_plugin builds both the VapourSynth and AviSynth+ bindings into the one dll;
-    # libp2p and AviSynth+ come from the subproject wraps. b_vscrt=mt matches the static CRT
-    # that the triplet builds its libraries against, and prefer_static makes meson ask pkgconf
-    # for Libs.private so the transitive static deps get linked.
-    - name: Build
-      run: |
-        $env:PKG_CONFIG = "$env:VCPKG_INSTALLATION_ROOT\installed\$env:VCPKG_TRIPLET\tools\pkgconf\pkgconf.exe"
-        $env:PKG_CONFIG_PATH = "$env:VCPKG_INSTALLATION_ROOT\installed\$env:VCPKG_TRIPLET\lib\pkgconfig"
-        # A CPU only build, disabled rather than left on auto so it stays one: GPU support needs an
-        # FFmpeg master, while vcpkg packages releases. The GPU path is built and exercised by the
-        # linux wheel job instead; what this job covers that no other does is the MSVC toolchain and
-        # the AviSynth+ interface.
-        meson setup build -Denable_plugin=true -Denable_gpu=disabled -Dprefer_static=true -Db_lto=true -Db_vscrt=mt
-        meson compile -C build
-
-    - uses: actions/upload-artifact@v7
-      with:
-        name: msvc-win_amd64
-        path: build/bestsource.dll
-
-  publish:
-    permissions:
-      id-token: write
-    needs: [build-non-windows-wheel, build-windows-wheel]
-    if: ${{ startsWith(github.ref, 'refs/tags/R') }}
-    runs-on: ubuntu-latest
-
-    steps:
-    # Only the wheel/sdist artifacts, so the raw dll from build-windows-msvc is left out.
-    - uses: actions/download-artifact@v8
-      with:
-        path: dist
-        pattern: bestsource-*
-        merge-multiple: true
-
-    - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bestsource-${{ matrix.arch }}
+          path: output/*
 
   release:
+    needs: [build-linux]
+    if: ${{ startsWith(github.ref, 'refs/tags/R') || startsWith(github.ref, 'refs/tags/v') || github.event.inputs.create_release == 'true' }}
+    runs-on: ubuntu-latest
     permissions:
       contents: write
-    needs: [build-windows-wheel, build-windows-msvc]
-    if: ${{ startsWith(github.ref, 'refs/tags/R') }}
-    runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/download-artifact@v8
-      with:
-        name: msvc-win_amd64
-        path: msvc
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
 
-    - uses: actions/download-artifact@v8
-      with:
-        name: bestsource-win_amd64
-        path: clang
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -name "libbestsource-linux_x86_64.so" -exec cp {} release-assets/libbestsource-linux-x86_64.so \;
+          find artifacts -name "libbestsource-linux_aarch64.so" -exec cp {} release-assets/libbestsource-linux-aarch64.so \;
+          ls -lh release-assets/
 
-    # Both dlls are labelled by toolchain in the filename. The clang build targets
-    # x86_64-w64-windows-gnu, whose C++ ABI cannot match the MSVC built AviSynth+, so it
-    # is built with enable_avisynth=false and exports VapourSynthPluginInit2 only --
-    # hence vs-only. The clang dll is taken out of the wheel so the build job that
-    # produces it stays untouched. The release normally already exists by this point;
-    # create it if the tag was pushed on its own.
-    - name: Attach Windows builds to the release
-      env:
-        GH_TOKEN: ${{ github.token }}
-        # This job only downloads artifacts, it never checks out, so gh has no git remote to
-        # infer the repository from and every command below would fail on "not a git repository".
-        GH_REPO: ${{ github.repository }}
-      run: |
-        tag="${{ github.ref_name }}"
-        msvc_name="BestSource-$tag-win64-msvc"
-        clang_name="BestSource-$tag-win64-clang-vs-only"
-
-        mv msvc/bestsource.dll "$msvc_name.dll"
-
-        # Matched loosely on purpose: the gnu toolchain names it libbestsource.dll, msvc
-        # would name it bestsource.dll. The wheel is statically linked so it holds one dll.
-        unzip -q clang/*.whl -d clang-extract
-        clang_dll="$(find clang-extract -name '*.dll' -print -quit)"
-        test -n "$clang_dll" || { echo "no dll inside the clang wheel"; exit 1; }
-        mv "$clang_dll" "$clang_name.dll"
-
-        # One dll per zip, keeping the toolchain suffixed name inside: the two builds are
-        # alternatives, so unpacking both into a plugins directory must not collide.
-        zip -qj "$msvc_name.zip" "$msvc_name.dll"
-        zip -qj "$clang_name.zip" "$clang_name.dll"
-
-        gh release view "$tag" >/dev/null 2>&1 \
-          || gh release create "$tag" --title "$tag" --generate-notes
-        gh release upload "$tag" "$msvc_name.zip" "$clang_name.zip" --clobber
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="${{ github.ref_name }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ startsWith(github.ref, 'refs/tags/') }}" != "true" ]; then
+            tag="v$(date +'%Y%m%d')-${GITHUB_SHA:0:7}"
+          fi
+          gh release view "$tag" >/dev/null 2>&1 \
+            || gh release create "$tag" --title "$tag" --generate-notes
+          gh release upload "$tag" release-assets/* --clobber
